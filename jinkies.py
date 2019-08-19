@@ -42,6 +42,7 @@ with read:org permissions:
 """
 
 URL=""
+CRUMB_HEADER=None
 
 def damnit(string):
     if isinstance(string, str):
@@ -120,6 +121,18 @@ def main():
     elif args['status']:
         return cmd_status(args)
 
+def get_jenkins_crumb():
+    global CRUMB_HEADER
+    if CRUMB_HEADER:
+        return CRUMB_HEADER
+    url = "%s/crumbIssuer/api/xml?xpath=concat(//crumbRequestField,\":\",//crumb)" % URL
+    resp = requests.get(url)
+    if not resp.ok:
+        print_response_err(resp)
+        return
+    CRUMB_HEADER = dict([resp.content.split(':')])
+    return CRUMB_HEADER
+
 def print_job(job):
     print job['name']
 
@@ -127,12 +140,17 @@ def print_response_err(resp):
     print "Error: %s" % (resp)
     print resp.text
 
-def cmd_list(args):
-    url = "%s/api/json" % URL
-    resp = requests.get(url)
+def jenkins_get(url_path):
+    url = URL + url_path
+    headers = get_jenkins_crumb()
+    resp = requests.get(url, headers=headers)
     if not resp.ok:
         print_response_err(resp)
         return
+    return resp
+
+def cmd_list(args):
+    resp = jenkins_get("/api/json")
     doc = resp.json()
     if args['jobs']:
         for job in doc['jobs']:
@@ -142,22 +160,14 @@ def cmd_list(args):
             print "%s: %s" % (view['name'], view['url'])
 
 def cmd_show(args):
-    url = "%s/view/%s/api/json" % (URL, args['<view>'])
-    resp = requests.get(url)
-    if not resp.ok:
-        print_response_err(resp)
-        return
+    resp = jenkins_get("/view/%s/api/json" % args['<view>'])
     doc = resp.json()
     for job in doc['jobs']:
         print_job(job)
 
 def cmd_status(args):
     job = args['<job>']
-    url = "%s/job/%s/api/json?depth=1" % (URL, job)
-    resp = requests.get(url)
-    if not resp.ok:
-        print_response_err(resp)
-        return
+    resp = jenkins_get("/job/%s/api/json?depth=1" % job)
     doc = resp.json()
     # print the job and a short description (first line)
     print "%s: %s" % (doc.get("displayName", job), doc.get("description", "").split("\n")[0])
@@ -176,11 +186,7 @@ def cmd_status(args):
 
 def cmd_view(args):
     job = args['<job>']
-    url = "%s/job/%s/api/json?depth=1" % (URL, job)
-    resp = requests.get(url)
-    if not resp.ok:
-        print_response_err(resp)
-        return
+    resp = jenkins_get("/job/%s/api/json?depth=1" % job)
     doc = resp.json()
     # print the job and a short description (first line)
     print "%s: %s" % (doc.get("displayName", job), doc.get("description", "").split("\n")[0])
@@ -200,7 +206,7 @@ def cmd_view(args):
     # if there is a queued job, lets wait for it to start
     if doc['inQueue']:
         next = doc['nextBuildNumber']
-        watch(URL, job, next)
+        watch(job, next)
         return
 
     previous = doc['lastBuild']
@@ -214,23 +220,23 @@ def cmd_view(args):
         print "%s/job/%s/%s" % (URL, job, previous['number'])
         return
 
-    watch(URL, job, previous['number'])
+    watch(job, previous['number'])
 
 
-def watch(URL, job, build):
+def watch(job, build):
     """Watch console output for a job.  In the event that it hasn't begun yet
     (eg. it is queued), wait for it to start and then watch the output."""
     console = lambda: get_console(job, build)
 
     first = True
     firstWait = True
-    url = "%s/job/%s/%s/api/json" % (URL, job, build)
+    url = "/job/%s/%s/api/json" % (job, build)
     cp = 0
     failures = 0
     waits = 0
     while 1:
         try:
-            resp = requests.get(url)
+            resp = jenkins_get(url)
         except requests.exceptions.ConnectionError:
             if failures > 5:
                 print "Failure loading job for %s" % (job)
@@ -238,7 +244,7 @@ def watch(URL, job, build):
             failures += 1
             continue
         if not resp.ok and first:
-            r2 = requests.get("%s/job/%s/api/json" % (URL, job))
+            r2 = jenkins_get("/job/%s/api/json" % job)
             waits += 1
             if not r2.ok:
                 print "Failure loading job for %s" % (job)
@@ -277,7 +283,9 @@ def watch(URL, job, build):
         time.sleep(1.5)
 
 def get_console(job, build):
-    resp = requests.get("%s/job/%s/%s/logText/progressiveHtml" % (URL, job, build))
+    # not using jenkins_get because we want to handle the error here
+    headers = get_jenkins_crumb()
+    resp = requests.get("%s/job/%s/%s/logText/progressiveHtml" % (URL, job, build), headers=headers)
     if not resp.ok:
         return []
     text = colorize(resp.text)
@@ -286,11 +294,7 @@ def get_console(job, build):
 
 def cmd_params(args):
     job = args['<job>']
-    url = "%s/job/%s/api/json" % (URL, job)
-    resp = requests.get(url)
-    if not resp.ok:
-        print_response_err(resp)
-        return
+    resp = jenkins_get("/job/%s/api/json" % job)
     doc = resp.json()
     options = _param_defs_from_job(doc)
     if len(options) == 0:
@@ -305,11 +309,7 @@ def cmd_build(args):
     # first, fetch the job to figure out what the next build number is
     # this also lets us bail out if the job is invalid
     job = args['<job>']
-    url = "%s/job/%s/api/json" % (URL, job)
-    resp = requests.get(url)
-    if not resp.ok:
-        print_response_err(resp)
-        return
+    resp = jenkins_get("/job/%s/api/json" % job)
     doc = resp.json()
     build = doc['nextBuildNumber']
     job_param_defs = _param_defs_from_job(doc)
@@ -322,17 +322,18 @@ def cmd_build(args):
             print "Param '%s' isn't an option for this job." % p
             return
     if params:
-        url = "%s/job/%s/buildWithParameters?delay=0sec" % (URL, job)
+        url_path = "/job/%s/buildWithParameters?delay=0sec" % job
     else:
-        url = "%s/job/%s/build?delay=0sec" % (URL, job)
-    resp = requests.post(url, data=params)
+        url_path = "/job/%s/build?delay=0sec" % job
+    headers = get_jenkins_crumb()
+    resp = requests.post(URL + url_path, data=params, headers=headers)
     if not resp.ok:
         print "Error starting build:"
         print_response_err(resp)
         return
 
     if not args.get('--no-log', False):
-        watch(URL, job, build)
+        watch(job, build)
 
 
 def _param_defs_from_job(job_json):
